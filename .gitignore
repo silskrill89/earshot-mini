@@ -1,0 +1,51 @@
+# Build outputs
+build/
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+
+# Node
+node_modules/
+
+# Local tooling databases
+.sadie/*.db*
+.harness-memory/memory.sqlite
+__pycache__/
+
+# Logs
+logs/
+*.log
+
+# Proprietary RE targets - DO NOT publish (author copyright)
+original_files/
+
+# Local secrets
+tools/secrets.local.ps1
+
+# Machine-specific workspace registration (regenerated per machine)
+.lsai/
+
+# Large binary caches of mod distributions
+*.7z
+*.zip
+
+# Agent harness / local-only state
+.serena/
+.opencode/
+.harness-memory/
+.sadie/
+memory-bank/
+.obsidian/
+
+# Read-only reference clones (build needs only external/miniaudio,
+# external/subhook and the external/injector submodule)
+external/openal-soft/
+external/EarShotOpenAL/
+external/MiniAudioO3DE/
