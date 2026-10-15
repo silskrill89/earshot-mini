@@ -90,6 +90,14 @@ public:
     bool                  WeaponHasStems(unsigned weaponType, int modelId) const;
     size_t                WeaponCount() const { return m_weapons.size(); }
 
+    // --- read-only iteration for the debug menu (src/ui/EshUiMenu.cpp) ---
+    // The live bank instance is file-local to the façade TU (src/audio/
+    // EarshotAudio.cpp:41 sits inside an anonymous namespace — dumpbin on the
+    // object file shows `anonymous namespace'::s_bank), so the UI builds its
+    // own probe bank through EshFolderScanner and iterates it via these.
+    const std::unordered_map<uint64_t, EshWeaponEntry>& RegisteredWeapons() const { return m_weapons; }
+    const std::unordered_map<std::string, EshGenericEntry>& GenericEntries() const { return m_generic; }
+
     // --- generic storage (flat map; typed key builders below) ---
     // Create-on-demand WITHOUT touching an existing entry's tuning (the
     // scanner fills paths; the façade's INI pass fills tuning).
@@ -136,6 +144,17 @@ public:
     static void EshLogClearFile();                       // AR logging.cpp:77-101
     static void EshLogSetConfig(bool enabled, unsigned long long maxBytes);
     static bool EshLogEnabled() { return s_logging; }
+    // Debug-lane writer (src/debug/EshLog.h): append ONE pre-formatted line
+    // (its own [HH:MM:SS.mmm] prefix — no AR date prefix) + '\n'. Same
+    // Logging gate + byte cap as EshLog; no farewell line (EshLog owns that).
+    static void EshLog_WriteLine(const char* line);
+    // Rotate the current log to <name>.prev.log (MoveFileEx, CopyFile
+    // fallback — skygfx diagnostics.cpp:373-390). Call ONCE from Init BEFORE
+    // EshLogClearFile so the previous boot's evidence survives the truncate.
+    static void EshLogRotateFile();
+    // Exact path the file logger writes to (single source of truth — the
+    // debug-menu Status panel must not re-derive it). Returns a static buffer.
+    static const char* EshLogFilePath();
 
 private:
     static uint64_t Key(unsigned weaponType, int modelId) {

@@ -12,6 +12,7 @@
 
 #include <Windows.h>
 #include <stdio.h>
+#include <stdlib.h>   // strtoul (INI hex hotkey read)
 #include <string.h>
 #include <cctype>
 #include <cfloat>
@@ -24,13 +25,16 @@
 #include <eSurfaceType.h>   // TOTAL_NUM_SURFACE_TYPES (PSDK enums dir)
 
 #include "CVector.h"   // plugin-sdk (complete type; fwd-declared in the façade header)
+#include "CMessages.h" // CMessages::AddMessageJumpQ — on-screen toasts (PSDK)
 
 #include "loaders/EshIniReader.h"
 #include "loaders/EshFolderScanner.h"
 #include "loaders/EshSoundBank.h"
 #include "engine/EshAudioEngine.h"
+#include "engine/EshEffects.h"   // occlusion/incidence coloration config (INI [MAIN])
 #include "engine/EshListener.h"
 #include "engine/EshVoicePool.h"
+#include "debug/EshLog.h"   // ESH_LOG* throttle/lifecycle macros -> EarshotReminid.log
 
 namespace {
 
@@ -51,6 +55,48 @@ float    s_stereoAmbienceVol = 0.3f;   // AR Loaders.cpp:467
 // (re-audio-map.md §1); M1 adds shoot+after (+distant/low_ammo/dryfire) per
 // event across concurrent peds — 24 voices gives headroom.
 constexpr unsigned kVoicePoolVoices = 24;
+
+// ---------------------------------------------------------------------------
+// Debug hotkeys + toasts (verification aid; game thread only)
+// ---------------------------------------------------------------------------
+// INI [MAIN] hex virtual-key codes, 0 = disabled. Edge-detect poll pattern is
+// skygfx's: GetAsyncKeyState & 0x8000 vs the previous frame's state, once per
+// frame (postfx.cpp:1397-1421); key parsing mirrors skygfx's hex read
+// (main.cpp:2875-2881, :2915-2924 — a missing key keeps the default).
+int  s_keyVerbose      = 0x76;   // F7 — toggle the logger (verbose ON/OFF)
+int  s_keyReloadAudio  = 0x78;   // F9 — EarshotAudio_ReloadFolders()
+bool s_prevVerboseDown = false;
+bool s_prevReloadDown  = false;
+
+// PostInit's toast is deferred to the first OnFrame: initGameEvent.after runs
+// before the HUD has drawn a frame, so a message queued there can expire
+// unseen. Flushed once, then cleared.
+const char* s_pendingToast = nullptr;
+
+// INI hex key read: value is hex, "0x" prefix optional; empty/missing keeps def.
+int ReadHexKey(const EshIniReader& ini, const char* key, int def) {
+    std::string s = ini.ReadString("MAIN", key, "");
+    if (s.empty())
+        return def;
+    const char* p = s.c_str();
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+        p += 2;
+    return static_cast<int>(strtoul(p, nullptr, 16));
+}
+
+// On-screen confirmation (verification aid). CMessages::AddMessageJumpQ is
+// DECLARED by plugin-sdk CMessages.h:115 but its .cpp — the thunk to the game
+// function — is not compiled into this project (headers-only SDK here; only
+// DynAddress/GameVersion/Patch are added, premake5.lua:23-32), so the same
+// cdecl thunk plugin-sdk CMessages.cpp:192-195 emits is done locally at the
+// SA 1.0 US address (CMessages.cpp:37: FUNC_CMessages__AddMessageJumpQ
+// 0x69F1E0). flag 0 = STYLE_MIDDLE, 3 s display, bPreviousBrief=false keeps
+// it out of the pause-menu brief list; raw literal text displays as-is
+// (skygfx postfx.cpp:1404 precedent). Game thread only.
+void Toast(const char* text) {
+    using AddMessageJumpQ_t = void (__cdecl *)(const char*, unsigned int, unsigned short, bool);
+    reinterpret_cast<AddMessageJumpQ_t>(0x69F1E0)(text, 3000, 0, false);
+}
 
 // ---------------------------------------------------------------------------
 // Merge helpers — "overrides win": a caller field that differs from the
@@ -88,6 +134,23 @@ void ReadIniStage1() {
     EshSoundBank::s_distantGunshotDistance  = ini.ReadFloat("MAIN", "Distant gunshot distance", 50.0f);
     EshSoundBank::s_distantExplosionDistance = ini.ReadFloat("MAIN", "Distant explosion distance", 100.0f);
     s_stereoAmbienceVol = ini.ReadFloat("MAIN", "Stereo ambience volume", 0.3f);   // AR :467 (S7-S8 consumer)
+
+    // Realism effects (NEW — no AR counterpart; engine-layer state, pushed
+    // through the EshEffects setters so the future ImGui settings panel can
+    // flip the exact same knobs at runtime). Key names are the literal INI
+    // strings; bool keys accept 0/1.
+    EshEffects_SetOcclusionEnabled (ini.ReadBool ("MAIN", "Occlusion",         true));
+    EshEffects_SetOcclusionCutoff  (ini.ReadFloat("MAIN", "Occlusion cutoff",  700.0f));
+    EshEffects_SetIncidenceEnabled (ini.ReadBool ("MAIN", "Incidence",         true));
+    EshEffects_SetIncidenceCutoff  (ini.ReadFloat("MAIN", "Incidence cutoff",  1200.0f));
+    EshSoundBank::EshLog("Realism: occlusion=%d @ %.0f Hz, incidence=%d @ %.0f Hz",
+                         EshEffects_OcclusionEnabled() ? 1 : 0, EshEffects_OcclusionCutoff(),
+                         EshEffects_IncidenceEnabled() ? 1 : 0, EshEffects_IncidenceCutoff());
+
+    // Debug hotkeys — hex virtual-key codes, 0 = disabled (skygfx
+    // main.cpp:2915-2924: only overwrite when the INI carries the key).
+    s_keyVerbose     = ReadHexKey(ini, "keyVerbose", 0x76);      // F7
+    s_keyReloadAudio = ReadHexKey(ini, "keyReloadAudio", 0x78);  // F9
 }
 
 // LoadAttenuation lambda port (AR Loaders.cpp:478-489): keyPrefix empty ->
@@ -215,6 +278,32 @@ bool PlayResolved(const std::string& path, const EshSoundParams& params, const C
     return ok;
 }
 
+// Per-frame hotkey edge-detect (skygfx postfx.cpp:1397-1421 idiom). Runs on
+// the game thread from EarshotAudio_OnFrame — never from the audio thread.
+void PollHotkeys() {
+    if (s_keyVerbose) {
+        bool down = (GetAsyncKeyState(s_keyVerbose) & 0x8000) != 0;
+        if (down && !s_prevVerboseDown) {
+            const bool enable = !EarshotAudio_IsLogging();
+            // Log while the gate is still open on the way out; on the way in
+            // the line lands after SetLogging re-enables the writer.
+            if (!enable)
+                ESH_LOG("verbose OFF (key 0x%X)", s_keyVerbose);
+            EarshotAudio_SetLogging(enable);
+            if (enable)
+                ESH_LOG("verbose ON (key 0x%X)", s_keyVerbose);
+            Toast(enable ? "Earshot: verbose ON" : "Earshot: verbose OFF");
+        }
+        s_prevVerboseDown = down;
+    }
+    if (s_keyReloadAudio) {
+        bool down = (GetAsyncKeyState(s_keyReloadAudio) & 0x8000) != 0;
+        if (down && !s_prevReloadDown)
+            EarshotAudio_ReloadFolders();   // toasts on completion
+        s_prevReloadDown = down;
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -225,7 +314,10 @@ bool EarshotAudio_Init() {
     //    (required before ReadIniStage2's SetRicochetSurfaceTuning calls).
     s_bank.Clear();
 
-    // 1) Log reset (AR AudioManager.cpp:50 ClearLogFile at init)
+    // 1) Log reset (AR AudioManager.cpp:50 ClearLogFile at init). Rotate the
+    //    previous boot's log to EarshotReminid.prev.log FIRST so its crash
+    //    evidence survives the truncate (skygfx diagnostics.cpp:373-390).
+    EshSoundBank::EshLogRotateFile();
     EshSoundBank::EshLogClearFile();
 
     // 2) Paths: INI at PLUGIN_PATH/EarShot.ini; mod root per AR Main.cpp:3035-3036
@@ -235,15 +327,20 @@ bool EarshotAudio_Init() {
     // 3) MAIN INI (stage 1, AR Loaders.cpp:458-467) — enables logging first so
     //    the load report below is captured.
     ReadIniStage1();
+    // Lifecycle marker AFTER the Logging gate is read (earlier calls would
+    // always be dropped — s_logging defaults false until step 3).
+    ESH_LOG_ENTER("EarshotAudio_Init");
     EshSoundBank::EshLog("Mod folder: %s", s_modFolder.c_str());
 
     // 4) Engine + voice pool boot
     if (!EshAudioEngine::Instance().Init()) {
         EshSoundBank::EshLog("EshAudioEngine init FAILED — custom sounds disabled");
+        ESH_LOG_BAIL("EarshotAudio_Init", "EshAudioEngine init FAILED");
         return false;
     }
     if (!EshVoicePool_Init(kVoicePoolVoices)) {
         EshSoundBank::EshLog("EshVoicePool init FAILED — custom sounds disabled");
+        ESH_LOG_BAIL("EarshotAudio_Init", "EshVoicePool init FAILED");
         return false;
     }
 
@@ -251,10 +348,13 @@ bool EarshotAudio_Init() {
     LoadGenericFolders();
 
     EshSoundBank::EshLog("EarshotAudio_Init complete (weapons registered at PostInit)");
+    ESH_LOG_EXIT_OK("EarshotAudio_Init");
     return true;
 }
 
 bool EarshotAudio_PostInit() {
+    ESH_LOG_ENTER("EarshotAudio_PostInit");
+
     // 1) .earshot scan + weapon folder stems + marker tuning
     //    (AR RegisterAllWeapons, Main.cpp:3053-3058)
     int n = EshFolderScanner::ScanWeapons(s_modFolder.c_str(), s_bank);
@@ -263,6 +363,11 @@ bool EarshotAudio_PostInit() {
     ReadIniStage2();
 
     EshSoundBank::EshLog("EarshotAudio_PostInit complete (%d weapons)", n);
+    ESH_LOG_EXIT_OK("EarshotAudio_PostInit");
+
+    // On-screen confirmation — deferred to the first OnFrame (the HUD has not
+    // drawn a frame yet at initGameEvent.after).
+    s_pendingToast = "Earshot miniaudio v0.1.0-alpha1 loaded";
     return true;
 }
 
@@ -276,6 +381,14 @@ void EarshotAudio_Shutdown() {
 void EarshotAudio_OnFrame() {
     EshListener_Update();
     EshVoicePool_Tick();
+
+    // Debug lane (game thread): flush the deferred PostInit toast, then poll
+    // the INI hotkeys with edge detection (skygfx postfx.cpp:1397-1421).
+    if (s_pendingToast) {
+        Toast(s_pendingToast);
+        s_pendingToast = nullptr;
+    }
+    PollHotkeys();
 }
 
 void EarshotAudio_ReloadFolders() {
@@ -288,6 +401,8 @@ void EarshotAudio_ReloadFolders() {
     EshFolderScanner::ScanWeapons(s_modFolder.c_str(), s_bank);
     LoadGenericFolders();
     EshSoundBank::EshLog("EarshotAudio_ReloadFolders complete");
+    ESH_LOG("EarshotAudio_ReloadFolders ok (INI re-read + folders re-scanned)");
+    Toast("Earshot: audio folders reloaded");
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +430,9 @@ bool EarshotAudio_PlayWeaponStem(unsigned weaponType, int modelId,
     ApplyAttenuation(p, overrides, EshSoundBank::ClassAttenuation(*e, cls.c_str()));
     if (auto cp = EshSoundBank::ClassPitch(*e, cls.c_str()))
         p.pitch = overrides.pitch * (*cp);   // overrides.pitch × class pitch
+    // velocity/forward ride along untouched (pure pass-through: `p` started as
+    // a copy of `overrides` and neither ApplyAttenuation nor the pitch merge
+    // reads them) — see the EshSoundParams.h contract.
 
     EshSoundBank::EshLog("PlayWeaponStem type=%u model=%d class=%s -> %s",
                          weaponType, modelId, cls.c_str(), path->c_str());
@@ -422,6 +540,8 @@ bool EarshotAudio_PlayGenericStem(const char* category, int subKey,
         p.pitch = overrides.pitch * (*pitch);
     if (force2D || pos == nullptr)
         p.is2D = true;   // pos==nullptr -> 2D playback (façade contract)
+    // velocity/forward pass through verbatim (same rule as PlayWeaponStem);
+    // for the 2D branch the engine ignores both anyway.
 
     EshSoundBank::EshLog("PlayGenericStem %s subKey=%d -> %s", category, subKey, path->c_str());
     return PlayResolved(*path, p, p.is2D ? nullptr : pos);

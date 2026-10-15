@@ -18,6 +18,7 @@
 
 #include "audio/EarshotAudio.h"
 #include "hooks/EshHooks.h"
+#include "debug/EshCrashHandler.h"
 
 using namespace plugin;
 
@@ -27,6 +28,29 @@ using namespace plugin;
 class EarshotPlugin {
 public:
     EarshotPlugin() {
+        // --- Diagnostics boot (port of skygfx main.cpp:4730-4768 DllMain) ---
+        // This constructor IS the DllMain-equivalent entry (CRT static init of
+        // the ASI), so the crash stack is live before any game code runs:
+        //   * rotate + truncate EarshotReminid_dbg.log (prev boot preserved)
+        //   * install the VEH crash-context logger (forensics, never swallows)
+        //   * host-exe version check (warn + continue on mismatch)
+        //   * F8-held-at-load console (AllocConsole + freopen std streams)
+        // The unhandled-exception filter + minidump writer self-install from
+        // their own CRT static ctor (EshCrashHandler.cpp, crashhandler.cpp:282-302).
+        EshDiag_Init(nullptr);
+        EshDiag_InstallVEH();
+        EshDiag_CheckExeVersion();
+        EshDiag_ConsoleFromF8();
+        ESH_DBGLOG("=== earshot_reminid loading ===");
+
+        // Scope tags for the crash-context nearest-EIP lookup (+/-0x400,
+        // EshCrashHandler.cpp registry — skygfx registers its main lifecycle
+        // functions the same way, e.g. depthhook.cpp:399-402).
+        EshDiag_RegisterScope("EarshotAudio_Init",     (void*)&EarshotAudio_Init);
+        EshDiag_RegisterScope("EarshotAudio_PostInit", (void*)&EarshotAudio_PostInit);
+        EshDiag_RegisterScope("EshHooks_InstallAll",   (void*)&EshHooks_InstallAll);
+        EshDiag_RegisterScope("EarshotAudio_OnFrame",  (void*)&EarshotAudio_OnFrame);
+
         // Stage 1 (AR Main.cpp:3047-3051, initRwEvent.after): EarShot.ini MAIN
         // section + miniaudio engine boot + generic-category load.
         Events::initRwEvent += []() {

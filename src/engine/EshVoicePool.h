@@ -41,3 +41,9 @@ void  EshVoicePool_Tick();
 // True between successful Init and Shutdown. (Extra beyond the frozen
 // contract — kept for the façade boot path.)
 bool  EshVoicePool_IsReady();
+
+// Read-only voice census for the debug-menu Status panel (src/ui/
+// EshUiMenu.cpp): *outActive = slots holding a live, un-paused voice,
+// *outTotal = pool size. Either out pointer may be NULL. Const query only —
+// no other engine change.
+void  EshVoicePool_GetStats(unsigned* outActive, unsigned* outTotal);

@@ -58,6 +58,18 @@ bool EshAudioEngine::Init() {
     // Default config: 1 listener, device-native channels/rate, device-owned
     // mixing thread (re-miniaudio.md §1). Spatialization is ON by default for
     // every sound — no "enable 3D" flag exists.
+    //
+    // DOPPLER stays enabled by these defaults (verified against miniaudio.h
+    // v0.11.25 — nothing below turns it off):
+    //   * ma_engine_init(NULL, ...) → ma_engine_config_init() keeps the default
+    //     linear pitchResampling (:77462-77464) — the resampler the engine node
+    //     uses to apply dopplerPitch (:76607-76616).
+    //   * every sound's spatializer gets dopplerFactor 1 from
+    //     ma_spatializer_config_init (:52070; 0 would disable it).
+    //   * speed of sound 343.3 (OpenAL parity) is set explicitly below
+    //     (default already 343.3, :51758).
+    // Per-voice/listener velocities are pushed by EshVoicePool (source) and
+    // EshListener (listener).
     ma_result result = ma_engine_init(NULL, &m_engine);
     if (result != MA_SUCCESS) {
         EngineLog("[Earshot] FATAL: ma_engine_init failed: ");

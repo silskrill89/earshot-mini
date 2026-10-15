@@ -44,16 +44,25 @@ CCamera& TheCamera = *(CCamera*)0xB6F028;
 namespace {
 
 CVector s_prevPos;
+CVector s_listenerPos;          // last pushed position — EshListener_GetPosition
 DWORD   s_prevTickMs = 0;
 bool    s_havePrev = false;
 
-// dt clamp (task): reject both first-frame garbage and giant stalls so the
-// derived velocity can't explode. [1 ms, 100 ms]
-float ClampDt(DWORD nowMs) {
-    float dt = (nowMs - s_prevTickMs) * 0.001f;   // unsigned math: wraps correctly
-    if (dt < 0.001f) dt = 0.001f;
+// dt guard: reject both first-frame garbage (the caller's s_havePrev test) and
+// giant stalls (hitch / alt-tab) so the derived velocity can't explode.
+// Returns false when the delta is ZERO milliseconds — two updates inside the
+// same tick; dividing by a clamped 1 ms there would spike the velocity ~1000×
+// and inject a doppler pitch jump, so the caller keeps the previous velocity.
+// Valid range: (0 ms, 100 ms].
+bool ResolveDt(DWORD nowMs, float* outDt) {
+    const DWORD rawMs = nowMs - s_prevTickMs;   // unsigned math: wraps correctly
+    if (rawMs == 0) {
+        return false;
+    }
+    float dt = rawMs * 0.001f;
     if (dt > 0.100f) dt = 0.100f;
-    return dt;
+    *outDt = dt;                                 // rawMs >= 1 → dt >= 0.001 inherently
+    return true;
 }
 
 } // namespace
@@ -77,17 +86,27 @@ void EshListener_Update() {
     }
 
     // --- velocity (doppler input) -------------------------------------------
+    // (currentPos - prevPos) / dt, wall-clock dt from timeGetTime. First frame
+    // (s_havePrev false) and zero-ms deltas leave miniaudio's own default —
+    // listener velocity 0 — in place, i.e. no doppler until a real delta exists.
     DWORD now = timeGetTime();
     if (s_havePrev) {
-        float dt = ClampDt(now - s_prevTickMs);
-        CVector vel;
-        vel.x = (pos.x - s_prevPos.x) / dt;
-        vel.y = (pos.y - s_prevPos.y) / dt;
-        vel.z = (pos.z - s_prevPos.z) / dt;
-        ma_engine_listener_set_velocity(engine, 0, vel.x, vel.y, vel.z);    // :11376
+        float dt;
+        if (ResolveDt(now, &dt)) {
+            CVector vel;
+            vel.x = (pos.x - s_prevPos.x) / dt;
+            vel.y = (pos.y - s_prevPos.y) / dt;
+            vel.z = (pos.z - s_prevPos.z) / dt;
+            ma_engine_listener_set_velocity(engine, 0, vel.x, vel.y, vel.z);    // :11376
+        }
     }
 
+    s_listenerPos = pos;
     s_prevPos = pos;
     s_prevTickMs = now;
     s_havePrev = true;
+}
+
+const CVector& EshListener_GetPosition() {
+    return s_listenerPos;   // {0,0,0} until the first successful Update
 }

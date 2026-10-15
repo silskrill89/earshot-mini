@@ -140,6 +140,70 @@ static float SlowMoPitch() {
     return ts;
 }
 
+// ===========================================================================
+// source motion → EshSoundParams::velocity / ::forward (doppler + incidence)
+// ===========================================================================
+// UNITS — SA's m_vecMoveSpeed is per-TIMESTEP, not per-second:
+//   * CPhysical::ApplyMoveSpeed integrates
+//         GetPosition() += CTimer::GetTimeStep() * m_vecMoveSpeed
+//     (gta-reversed-modern game_sa/Entity/Physical.cpp:796-801,
+//      ApplyMoveSpeed @0x542DD0, installed at Physical.cpp:39)
+//   * CTimer::GetTimeStepInSeconds() = ms_fTimeStep / TIMESTEP_PER_SECOND with
+//     TIMESTEP_PER_SECOND = 50 (gta-reversed Timer.h:17,84) → one timestep is
+//     1/50 s ⇒ world units/second = m_vecMoveSpeed × 50.
+//   * Cross-check inside the game's OWN audio code, where both conventions
+//     meet in a single expression (AEVehicleAudioEntity.cpp:2417):
+//         bIsNotSimple ? vehicle->m_autoPilot.m_speed / 50.0f
+//                      : DotProduct(physical->m_vecMoveSpeed,
+//                                   physical->m_matrix->GetForward())
+//     m_autoPilot.m_speed is units/second; ÷50 lands exactly on
+//     m_vecMoveSpeed's per-timestep units — the same ×50 factor inverted.
+//   This conversion is load-bearing: doppler fed RAW m_vecMoveSpeed would
+//   report every source 50× too slow and the effect would effectively vanish.
+//
+// FORWARD — SA keeps the facing direction in the matrix's `up` row:
+//   CMatrix::GetForward() returns `up` (plugin-sdk CMatrix.h:73-74), and the
+//   game projects motion onto exactly that row for its own audio
+//   (AEVehicleAudioEntity.cpp:2417 above; Cam.cpp:611
+//   `m_vecFront = entityWorldMat.GetForward().Normalized()`).
+//   CPlaceable::GetForward() (CPlaceable.h) dereferences m_matrix with NO null
+//   check, so test m_matrix first; a placeable without a matrix has no
+//   reliable facing and we leave forward at {0,0,0} (omni → effect skipped).
+//
+// SLOW-MO — deliberately NOT scaled by CTimer::ms_fTimeScale: the façade
+//   already folds ms_fTimeScale into the playback pitch (SlowMoPitch above),
+//   and doppler is fed the game's LOGICAL motion so the two don't double-dip.
+//   (Nuance: SA multiplies the frame delta by ms_fTimeScale before deriving
+//   ms_fTimeStep — Timer.cpp:256-258 — so a strict wall-clock velocity would
+//   carry the factor too; keeping the raw value is a deliberate choice.)
+static void FillSourceMotion(CPhysical* entity, EshSoundParams& ov) {
+    if (!entity || !IsEntityPointerValid(entity)) {
+        return;   // velocity/forward stay {0,0,0}: static + omni
+    }
+
+    // velocity: per-timestep → world units/second (see header).
+    CVector vel = entity->m_vecMoveSpeed;
+    vel *= 50.0f;
+    if (std::isfinite(vel.x) && std::isfinite(vel.y) && std::isfinite(vel.z)) {
+        // Garbage guard: nothing legitimate in SA moves near 1000 u/s, and a
+        // doppler input that large would be nonsense anyway.
+        const float kMaxSpeed = 1000.0f;
+        if (vel.MagnitudeSqr() > kMaxSpeed * kMaxSpeed) {
+            vel = CVector(0.0f, 0.0f, 0.0f);
+        }
+        ov.velocity = vel;
+    }
+
+    // forward: normalised facing (the engine re-normalises defensively).
+    if (entity->m_matrix) {
+        CVector fwd = entity->m_matrix->GetForward();   // COPY — ref aliases the live matrix
+        if (fwd.MagnitudeSqr() > 1e-8f) {
+            fwd.Normalize();
+            ov.forward = fwd;
+        }
+    }
+}
+
 // INI-owned distant-shot thresholds — LIVE values loaded from the MAIN INI
 // section by the loader lane ("Distant gunshot distance" / "Distant explosion
 // distance", B.8 defaults 50/100, ourCommon.h:31-32). Reconciliation gap #4:
@@ -576,9 +640,12 @@ static void __fastcall HookedWeaponFire(CAEWeaponAudioEntity* self, void* /*unus
     }
 
     // Attenuation stays façade-owned (INI + .earshot class set); the hook only
-    // contributes the slow-mo pitch clamp.
+    // contributes the slow-mo pitch clamp + the source motion (doppler
+    // velocity / incidence forward) for the entity the shot is attributed to
+    // (shooter ped, or the victim CPhysical for AI heli guns — AR :196-213).
     EshSoundParams ov;
     ov.pitch = SlowMoPitch();
+    FillSourceMotion(entity, ov);
 
     const float dist = CVector::Distance(TheCamera.GetPosition(), pos);
     const bool farAway = dist >= EshSoundBank::s_distantGunshotDistance;   // AR :216
@@ -655,6 +722,7 @@ static void __fastcall HookedWeaponReload(CAEWeaponAudioEntity* self, void* /*un
             if (EarshotAudio_WeaponHasStems(wt, modelId)) {
                 EshSoundParams ov;
                 ov.pitch = SlowMoPitch();
+                FillSourceMotion(entity, ov);   // reloading ped/vehicle motion
                 if (EarshotAudio_PlayWeaponStem(wt, modelId, stemClass, pos, ov)) {
                     return;                                          // suppress vanilla
                 }
@@ -707,6 +775,7 @@ static void __fastcall HookedHandlePedHit(CAEPedAudioEntity* self, void* /*unuse
             const int modelId = victim->m_nModelIndex;
             EshSoundParams ov;
             ov.pitch = SlowMoPitch();
+            FillSourceMotion(victim, ov);   // the VICTIM's motion (task: ped hit)
 
             switch (audioEvent) {                        // AR :330-338 event set
             case AE_PED_HIT_HIGH:
@@ -775,6 +844,7 @@ static char __fastcall HookedHandlePedSwing(CAEPedAudioEntity* self, void* /*unu
                 if (!IsInsanePosition(pos)) {
                     EshSoundParams ov;
                     ov.pitch = SlowMoPitch();
+                    FillSourceMotion(ped, ov);   // swinging ped's motion
                     if (EarshotAudio_PlayWeaponStem(wt, modelId, "swing", pos, ov)) {
                         return (char)-1;                          // AR :507 suppress
                     }
@@ -841,6 +911,8 @@ static void __fastcall HookedExplosionAddAudioEvent(CAEExplosionAudioEntity* sel
 
     EshSoundParams ov;
     ov.pitch = SlowMoPitch();                                              // AR :526
+    // velocity/forward stay {0,0,0} on purpose: an explosion is a static,
+    // omni-directional source (task: no wiring for explosions).
 
     bool handled = false;
     if (!farAway) {
@@ -895,6 +967,8 @@ static int __fastcall HookedReportBulletHit(CAudioEngine* engine, int /*unused-e
         // entity — gravel-on-vehicle plays the gravel bucket. Deferred to S6.
         EshSoundParams ov;
         ov.pitch = SlowMoPitch();
+        // velocity/forward stay {0,0,0}: an impact point is static and omni
+        // (doppler/incidence wiring is deliberately PED-motion only).
         // Attenuation (maxDist 50 / refDist 3.5 / rolloff 5 / airAbs 3, AR
         // :452-456) is façade-owned (RICOCHET INI section, B.8).
         if (EarshotAudio_PlayGenericStem("ricochet", (int)surface, "ricochet", &posn, ov)) {
@@ -927,6 +1001,8 @@ static void* __fastcall HookedReportFrontEndAudio(CAudioEngine* engine, int /*un
         EshSoundParams ov;
         ov.is2D = true;                                  // 2D stereo (AR PlaySource2D)
         ov.pitch = SlowMoPitch();
+        // velocity/forward stay {0,0,0} on purpose: whizz is 2D (no spatializer
+        // consumes velocity, and there is no world position for incidence).
         if (EarshotAudio_PlayGenericStem("bullet_whizz", quadrant, "", nullptr, ov)) {
             return nullptr;                              // suppress vanilla
         }

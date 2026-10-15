@@ -32,10 +32,26 @@
 //     survives, so pause = get_cursor + stop, resume = seek + start.
 //   * ma_sound_uninit waits for the audio thread to finish with the node's
 //     buses (docs :2419-2460) — safe from the game thread.
+//   * Doppler is built into the spatializer: ma_sound_set_velocity :11426 and
+//     ma_engine_listener_set_velocity :11376 feed ma_doppler_pitch
+//     (:51701-51724, OpenAL-spec formula), the ratio of which the engine node
+//     folds into its resample ratio (:76607-76616). It is ON by default —
+//     dopplerFactor 1 (:52070), speedOfSound 343.3 (:51758), and the NULL
+//     engine config used by EshAudioEngine::Init keeps the default linear
+//     pitchResampling (:77462-77464) — nothing here disables it.
+//   * Per-voice coloration uses a second ma_lpf_node chained after the air
+//     filter; ma_lpf_node_reinit (:10939) only rewrites biquad coefficients
+//     into the node's preallocated heap (ma_lpf_reinit__internal isNew=false
+//     path, :48026-48155 — no alloc/free), so a game-thread reinit cannot race
+//     the audio thread's node teardown. Channel/order changes are rejected
+//     (:48042-48056) — we only ever move the cutoff, same as the air filter.
 #include "engine/EshVoicePool.h"
 
 #include <Windows.h>
+#include <mmsystem.h>   // timeGetTime (per-voice coloration throttle; winmm via pragma)
+#pragma comment(lib, "winmm.lib")
 
+#include <math.h>       // fabsf (coloration cutoff change detector)
 #include <new>
 #include <stdio.h>   // _snprintf (CRT secure warnings disabled in premake5.lua)
 #include <string>
@@ -46,6 +62,8 @@
 
 #include "engine/EshAudioEngine.h"
 #include "engine/EshDelayQueue.h"
+#include "engine/EshEffects.h"       // occlusion + incidence target cutoffs
+#include "engine/EshListener.h"      // EshListener_GetPosition (LOS origin)
 
 namespace {
 
@@ -56,10 +74,31 @@ constexpr unsigned kMaxVoiceCount     = 128;  // bound the per-slot node allocat
 constexpr float kAirAbsMinCutoffHz = 400.0f;
 constexpr float kAirAbsRefCutoffHz = 20000.0f;   // cutoff at factor 1.0
 
+// --- occlusion/incidence coloration (EshEffects) ----------------------------
+// Per-voice refresh period. Wrap-safe timeGetTime compare (the EshDelayQueue
+// signed-diff idiom, EshDelayQueue.cpp:71-73): at 200 ms and 24 voices the
+// worst case is ~120 world raycasts/s, and only while 3D voices are sounding.
+constexpr DWORD kColorRefreshMs   = 200;
+// Relative cutoff change that triggers a live ma_lpf_node_reinit; smaller
+// wobbles are ignored so the coefficient recompute never thrashes.
+constexpr float kColorRelChange   = 0.10f;
+
 struct EshVoiceSlot {
     ma_sound    sound{};          // bound per play via ma_sound_init_copy
     ma_lpf_node lpf{};            // persistent per-slot air-absorption filter
     bool        lpfReady = false;
+
+    // Occlusion + incidence coloration (EshEffects) — ONE shared order-2 LPF
+    // per 3D voice, chained AFTER the air filter (never replacing it):
+    //   sound → [air LPF] → [colorLpf] → reverb/endpoint
+    ma_lpf_node colorLpf{};
+    bool        colorReady  = false;  // ma_lpf_node_init succeeded at Init
+    bool        colorActive = false;  // this play is colorated (3D + INI on)
+    float       colorCutoff = 0.0f;   // cutoff currently LOADED in colorLpf
+    DWORD       colorStampMs = 0;     // last EshEffects evaluation (timeGetTime)
+    CVector     pos{};                // world position at play (3D only)
+    CVector     forward{};            // source facing at play (params.forward)
+
     bool        bound    = false;   // `sound` holds an initialized ma_sound
     bool        inUse    = false;   // played, not yet swept back to free
     bool        paused   = false;
@@ -219,9 +258,57 @@ bool PlayNow(const char* path, const EshSoundParams& p, const CVector* pos) {
         ma_sound_set_position(&v.sound, 0.0f, 0.0f, 0.0f);
         ma_sound_set_spatialization_enabled(&v.sound, MA_FALSE);
         v.is2D = true;
+        v.pos = CVector();          // 2D has no world anchor — clear stale data
+        v.forward = CVector();      // (neither is read while colorActive=false)
     } else {
         ma_sound_set_position(&v.sound, pos->x, pos->y, pos->z);        // :11422 (AR :577)
         v.is2D = false;
+        v.pos = *pos;              // LOS origin/target + incidence reference
+        v.forward = p.forward;     // EshSoundParams::forward (0,0,0 = omni)
+
+        // --- source velocity (doppler input) --------------------------------
+        // ma_sound_set_velocity :11426 stores it on the voice's spatializer;
+        // ma_spatializer_process reads it every block (:52632) into
+        // ma_doppler_pitch (:51701-51724, OpenAL-spec) and the engine node
+        // folds the resulting ratio into its resample ratio (:76607-76616).
+        // Zero velocity = static source → the set is skipped and the
+        // spatializer keeps its zeroed default (no doppler contribution from
+        // this side). Doppler itself is NOT disabled anywhere: EshAudioEngine
+        // inits with a NULL config (defaults: pitchResampling linear
+        // :77462-77464, per-sound dopplerFactor 1 :52070, speedOfSound 343.3
+        // :51758 — the explicit set at EshAudioEngine.cpp:79 just documents it).
+        // 2D voices skip it: spatialization is off, so nothing consumes it.
+        if (p.velocity.x != 0.0f || p.velocity.y != 0.0f || p.velocity.z != 0.0f) {
+            ma_sound_set_velocity(&v.sound, p.velocity.x, p.velocity.y, p.velocity.z);   // :11426
+        }
+    }
+
+    // --- per-voice node chain (game thread, assembled tail-first) -----------
+    //   3D + effects:  sound → [air LPF] → [colorLpf] → reverb/endpoint
+    //   3D, effects off: sound → [air LPF] → reverb/endpoint
+    //   2D:            sound → [air LPF] → reverb/endpoint   (no colorLpf)
+    // Re-attaching without an explicit detach is legal (docs :2143) and every
+    // node here was built with ma_engine_get_channels, so the channel-count
+    // equality the graph enforces (:74892-74894) holds at every hop.
+    ma_node* tail = eng.GetVoiceAttachTarget();
+
+    // Coloration (occlusion + incidence, EshEffects) — 3D voices only, and only
+    // while at least one of the two INI effects is on. 2D voices and pending
+    // delay-queue entries never carry the node (the queue has no node at all;
+    // an entry gets one only when EshDelayQueue actually plays it).
+    v.colorActive = (!v.is2D && v.colorReady &&
+                     (EshEffects_OcclusionEnabled() || EshEffects_IncidenceEnabled()));
+    if (v.colorActive) {
+        // Start "open" until the first throttled evaluation lands (next Tick,
+        // stamp 0 = never evaluated → it fires immediately). The cache must
+        // mirror the coefficients actually loaded at Init (transparent).
+        v.colorCutoff  = (float)TransparentCutoffHz(ma_engine_get_sample_rate(engine));
+        v.colorStampMs = 0;
+        if (ma_node_attach_output_bus(&v.colorLpf, 0, tail, 0) == MA_SUCCESS) {   // :10803
+            tail = &v.colorLpf;
+        } else {
+            v.colorActive = false;   // keep the flag honest if the hop fails
+        }
     }
 
     // --- air absorption (AR SetSourceAirAbsorptionFactor :579 → :1612) ------
@@ -242,22 +329,28 @@ bool PlayNow(const char* path, const EshSoundParams& p, const CVector* pos) {
         }
 
         // Re-init the slot's filter coefficients for this play. Order and
-        // channels are fixed at Init (ma_lpf_reinit rejects changing them,
-        // miniaudio.h:48268-48281); only the cutoff moves. The voice is not
-        // playing yet, and ma_lpf_node_reinit is the documented live-sweep
-        // entry point (:10939).
+        // channels are fixed at Init (ma_lpf_reinit rejects a format/channel/
+        // order change, miniaudio.h:48044-48066); only the cutoff moves. The
+        // voice is not playing yet, and ma_lpf_node_reinit is the sanctioned
+        // live-sweep entry point (:10939).
         ma_lpf_config lcfg = ma_lpf_config_init(ma_format_f32,
                                                 ma_engine_get_channels(engine),   // :11360
                                                 ma_engine_get_sample_rate(engine),
                                                 (double)cutoff, 2 /* order */);
-        if (ma_lpf_node_reinit(&lcfg, &v.lpf) == MA_SUCCESS) {   // :10939
-            ma_node_attach_output_bus(&v.sound, 0, &v.lpf, 0);   // voice → LPF (→ reverb → endpoint)
-        } else {
-            ma_node_attach_output_bus(&v.sound, 0, eng.GetVoiceAttachTarget(), 0);
+        if (ma_lpf_node_reinit(&lcfg, &v.lpf) == MA_SUCCESS            // :10939
+            && ma_node_attach_output_bus(&v.lpf, 0, tail, 0) == MA_SUCCESS) {
+            tail = (ma_node*)&v.lpf;   // air stage now sits under the color stage
         }
-    } else {
-        // Default attachment after init_copy is the endpoint (:78442);
-        // re-attach to the voice bus target (reverb node or endpoint).
+        // On failure the air stage simply stays out of the chain: `tail` is
+        // still the color node (or the target) and the voice plays without air
+        // absorption — same "the filter is optional" policy as Init.
+    }
+
+    // sound → tail (default attachment after init_copy is the endpoint,
+    // :78442; every pool voice is re-attached to the voice bus target here —
+    // the reverb node when one exists, otherwise the endpoint).
+    result = ma_node_attach_output_bus(&v.sound, 0, tail, 0);   // :10803
+    if (result != MA_SUCCESS) {
         ma_node_attach_output_bus(&v.sound, 0, eng.GetVoiceAttachTarget(), 0);
     }
 
@@ -292,6 +385,85 @@ void SweepFinishedVoices() {
             v.bound  = false;
             v.inUse  = false;
             v.is2D   = false;
+            v.colorActive = false;   // coloration bookkeeping dies with the voice
+            v.forward = CVector();
+        }
+    }
+}
+
+// --- occlusion + incidence coloration, per active 3D voice -------------------
+// GAME THREAD ONLY (EshVoicePool_Tick ← EarshotAudio_OnFrame). Each voice
+// re-evaluates its target cutoff at most every kColorRefreshMs and only
+// rewrites the biquad when the target moved more than kColorRelChange (10%)
+// from what is loaded — the hysteresis keeps a hovering listener from
+// re-initing every tick.
+//
+// ma_lpf_node_reinit (:10939) is the sanctioned live reinit: it takes the
+// ma_lpf_config (format/channels/sampleRate/order must match Init,
+// :48044-48066) and, on the isNew=false path, only recomputes coefficients
+// into the node's preallocated heap (:48026-48155) — no allocation, nothing
+// for the audio thread to observe mid-teardown.
+void UpdateColoration() {
+    if (!g_ready || g_shutdown) {
+        return;
+    }
+    // NOTE: no "both effects disabled → bail" shortcut here. Voices that
+    // started while an effect was ON still carry the color node in their
+    // chain, so we must keep walking them — EshEffects_ComputeColorationCutoff
+    // returns "open" (and makes NO game call) while both flags are off, which
+    // opens those voices back up on the next 10% check. The loop itself is a
+    // handful of branches per frame; the expensive raycast lives behind the
+    // enable flags inside EshEffects.
+    EshAudioEngine& eng = EshAudioEngine::Instance();
+    if (!eng.IsReady()) {
+        return;
+    }
+    ma_engine* engine = eng.GetEngine();
+
+    const DWORD now = timeGetTime();
+    const CVector& listenerPos = EshListener_GetPosition();
+    const ma_uint32 channels   = ma_engine_get_channels(engine);      // :11360
+    const ma_uint32 sampleRate = ma_engine_get_sample_rate(engine);   // :11361
+    const float ceiling = (float)TransparentCutoffHz(sampleRate);
+
+    for (unsigned i = 0; i < g_voiceCount; ++i) {
+        EshVoiceSlot& v = g_voices[i];
+        if (!v.inUse || v.paused || !v.bound || v.is2D ||
+            !v.colorActive || !v.colorReady) {
+            continue;   // 2D / idle / paused / non-colorated voices
+        }
+        // Wrap-safe per-voice throttle (EshDelayQueue.cpp:71-73 idiom): both
+        // operands are DWORD, so the subtraction wraps correctly.
+        if ((int)(now - v.colorStampMs) < (int)kColorRefreshMs) {
+            continue;
+        }
+        v.colorStampMs = now;
+
+        float target = EshEffects_ComputeColorationCutoff(listenerPos, v.pos, v.forward);
+        if (target > ceiling) {
+            target = ceiling;   // TransparentCutoffHz: strict Nyquist guard
+        }
+        if (target < kEshEffectsMinCutoffHz) {
+            target = kEshEffectsMinCutoffHz;
+        }
+
+        const float prev = v.colorCutoff;
+        if (target >= ceiling && prev >= ceiling) {
+            continue;   // both effects wide open → node already rests there
+        }
+        if (fabsf(target - prev) <= kColorRelChange * prev) {
+            continue;   // <10% move → leave the loaded coefficients alone
+        }
+
+        ma_lpf_config cfg = ma_lpf_config_init(ma_format_f32, channels, sampleRate,
+                                               (double)target, 2 /* order */);
+        if (ma_lpf_node_reinit(&cfg, &v.colorLpf) == MA_SUCCESS) {   // :10939
+            v.colorCutoff = target;
+        } else {
+            PoolLog("[Earshot] VoicePool: coloration ma_lpf_node_reinit failed\n");
+            // cache untouched → retried on this voice's next throttled pass
+            // (the node keeps its last coefficients, so the chain stays valid
+            // either way)
         }
     }
 }
@@ -300,6 +472,22 @@ void SweepFinishedVoices() {
 
 bool EshVoicePool_IsReady() {
     return g_ready;
+}
+
+// Debug-menu Status panel: read-only voice census (const query, no side
+// effects). The bool/unsigned reads are single-copy on x86, so sampling from
+// the game thread while the audio thread runs is benign — this is a display
+// counter, not a control path.
+void EshVoicePool_GetStats(unsigned* outActive, unsigned* outTotal) {
+    unsigned active = 0;
+    if (g_voices) {
+        for (unsigned i = 0; i < g_voiceCount; ++i) {
+            if (g_voices[i].inUse && !g_voices[i].paused)
+                ++active;
+        }
+    }
+    if (outActive) *outActive = active;
+    if (outTotal)  *outTotal  = g_voiceCount;
 }
 
 bool EshVoicePool_Init(unsigned voiceCount) {
@@ -332,14 +520,40 @@ bool EshVoicePool_Init(unsigned voiceCount) {
     }
     g_voiceCount = voiceCount;
 
-    // Per-slot air-absorption LPF nodes, created upfront and pre-attached to
-    // the voice bus target: voice → [LPF] → reverb → endpoint. The cutoff is
-    // re-inited per play (PlayNow); when a play doesn't need the filter the
-    // voice bypasses the node entirely.
+    // Per-slot filter nodes, created upfront and pre-attached into the resting
+    // chain: [air LPF] → [coloration LPF] → reverb → endpoint. PlayNow rewires
+    // the head of that chain per play (sound → [air] → [color] → target), so a
+    // voice that needs neither filter simply bypasses both; a 2D voice never
+    // touches the coloration node at all. The air cutoff is re-inited per play;
+    // the color cutoff is driven by UpdateColoration while the voice sounds.
     const ma_uint32 channels   = ma_engine_get_channels(engine);      // :11360
     const ma_uint32 sampleRate = ma_engine_get_sample_rate(engine);   // :11361
     ma_node* target = eng.GetVoiceAttachTarget();
     for (unsigned i = 0; i < g_voiceCount; ++i) {
+        // --- coloration LPF (occlusion + incidence) — created FIRST, because
+        // the air filter pre-attaches to it below.
+        ma_lpf_node_config ccfg = ma_lpf_node_config_init(channels, sampleRate,
+                                                          TransparentCutoffHz(sampleRate),
+                                                          2 /* order */);   // :10929
+        ma_result rc = ma_lpf_node_init(ma_engine_get_node_graph(engine), &ccfg, NULL,
+                                        &g_voices[i].colorLpf);   // :10938
+        if (rc == MA_SUCCESS) {
+            g_voices[i].colorReady = true;
+            // Cache must mirror the coefficients just loaded (both effects
+            // "open" at rest) or the first 10%-change test would misfire.
+            g_voices[i].colorCutoff = (float)TransparentCutoffHz(sampleRate);
+            if (target) {
+                ma_node_attach_output_bus(&g_voices[i].colorLpf, 0, target, 0);
+            }
+        } else {
+            // Optional like the air filter: the slot still plays, just without
+            // occlusion/incidence coloration (colorActive stays false).
+            PoolLog("[Earshot] EshVoicePool_Init: coloration ma_lpf_node_init failed: ");
+            PoolLog(ma_result_description(rc));
+            PoolLog("\n");
+        }
+
+        // --- air-absorption LPF -------------------------------------------
         ma_lpf_node_config cfg = ma_lpf_node_config_init(channels, sampleRate,
                                                          TransparentCutoffHz(sampleRate),
                                                          2 /* order */);   // :10929
@@ -347,8 +561,10 @@ bool EshVoicePool_Init(unsigned voiceCount) {
                                        &g_voices[i].lpf);   // :10938
         if (r == MA_SUCCESS) {
             g_voices[i].lpfReady = true;
-            if (target) {
-                ma_node_attach_output_bus(&g_voices[i].lpf, 0, target, 0);   // :10803
+            ma_node* airTail = g_voices[i].colorReady ? (&g_voices[i].colorLpf)
+                                                      : target;
+            if (airTail) {
+                ma_node_attach_output_bus(&g_voices[i].lpf, 0, airTail, 0);   // :10803
             }
         } else {
             // The filter is optional: the slot still plays, just without the
@@ -392,6 +608,8 @@ void EshVoicePool_StopAll() {
         v.paused = false;
         v.inUse  = false;
         v.is2D   = false;
+        v.colorActive = false;   // no voice → nothing for UpdateColoration to touch
+        v.forward = CVector();
         if (v.bound) {
             ma_sound_stop(&v.sound);     // :11401
             ma_sound_uninit(&v.sound);   // :11397
@@ -439,6 +657,7 @@ void EshVoicePool_Tick() {
         return;
     }
     EshDelayQueue_ProcessDue();   // AR ProcessScheduledSounds :235-249
+    UpdateColoration();           // occlusion + incidence (per-voice, throttled)
     SweepFinishedVoices();        // AR Main.cpp:3244-3253
 }
 
@@ -463,6 +682,14 @@ void EshVoicePool_Shutdown() {
             if (v.lpfReady) {
                 ma_lpf_node_uninit(&v.lpf, NULL);   // :10940
                 v.lpfReady = false;
+            }
+            // Air stage first (it feeds the color stage), then the coloration
+            // node — reverse of the resting chain so no node is torn down while
+            // another still points at it.
+            if (v.colorReady) {
+                ma_lpf_node_uninit(&v.colorLpf, NULL);   // :10940
+                v.colorReady  = false;
+                v.colorActive = false;
             }
         }
         delete[] g_voices;

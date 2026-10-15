@@ -20,6 +20,18 @@ workspace "earshot_reminid"
 	files { "external/subhook/subhook.c" }
 	files { "external/subhook/*.h" }
 
+	-- ImGui (MIT, LICENSE.txt kept in external/imgui) — vendored copy of
+	-- E:/SDKs/imgui-master, the tree skygfx_plus_expIV actually builds
+	-- (skygfx's own external/imgui mirror is stale — do not copy from it).
+	-- The 6 translation units are listed EXPLICITLY on purpose: a glob over
+	-- external/imgui would also pick up imgui_demo.cpp if it is ever added.
+	files { "external/imgui/imgui.cpp" }
+	files { "external/imgui/imgui_draw.cpp" }
+	files { "external/imgui/imgui_tables.cpp" }
+	files { "external/imgui/imgui_widgets.cpp" }
+	files { "external/imgui/backends/imgui_impl_dx9.cpp" }
+	files { "external/imgui/backends/imgui_impl_win32.cpp" }
+
 	-- plugin-sdk (master) ships headers ONLY in E:/SDKs/plugin-sdk-master — no
 	-- output/lib/plugin.lib like the Hzan original linked (EarShot.vcxproj:153).
 	-- These shared/*.cpp provide the symbols plugin.h's inline machinery calls:
@@ -35,6 +47,8 @@ workspace "earshot_reminid"
 	includedirs { "external/injector/include" }
 	includedirs { "external/miniaudio" }
 	includedirs { "external/subhook" }
+	includedirs { "external/imgui" }
+	includedirs { "external/imgui/backends" }
 
 	-- plugin-sdk (v1004) — mirrored exactly from skygfx_plus_expIV/premake5.lua:41-42
 	includedirs { "E:/SDKs/plugin-sdk-master/plugin_sa/game_sa" }
@@ -77,6 +91,9 @@ project "earshot_reminid"
 	-- subhook is linked statically (README.md:14): without SUBHOOK_STATIC the
 	-- header declares __declspec(dllimport) on Windows and linking fails.
 	defines { "SUBHOOK_STATIC" }
+	-- MiniDumpWriteDump (src/debug/EshCrashHandler.cpp crash minidumps) — the
+	-- only extra import library this plugin links.
+	links { "dbghelp" }
 	buildoptions { "/FS" }
 
 	filter "configurations:Debug"

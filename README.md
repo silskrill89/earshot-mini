@@ -14,7 +14,7 @@ unmodified.
 
 1. **Remove** the old `EarShot.asi` (EarShotOpenAL) — do not run both mods at
    once. `OpenAL32.dll` / `alsoft.ini` are no longer needed by EarShot.
-2. Copy everything from **[`dist/earshot_reminid_v0.1.0-m1/`](dist/earshot_reminid_v0.1.0-m1/)**
+2. Copy everything from **[`dist/earshot_reminid_v0.1.0-alpha1/`](dist/earshot_reminid_v0.1.0-alpha1/)**
    (`earshot_reminid.asi`, `EarShot.ini`) into your game folder — next to
    `gta_sa.exe`, or into `scripts\`, or a ModLoader subfolder.
 3. Sound content folder: `GameFolder\data\EarShot\` is used automatically if
@@ -23,13 +23,13 @@ unmodified.
 4. Start the game.
 
 Full instructions, file-structure reference and troubleshooting:
-**[dist/earshot_reminid_v0.1.0-m1/readme.txt](dist/earshot_reminid_v0.1.0-m1/readme.txt)**
+**[dist/earshot_reminid_v0.1.0-alpha1/readme.txt](dist/earshot_reminid_v0.1.0-alpha1/readme.txt)**
 (same format as the old EarShotOpenAL readme).
 
 The log file is `EarshotReminid.log` next to the .asi. Set
 `Logging = true` in `EarShot.ini` for full load/playback tracing.
 
-## What works in v0.1.0-m1
+## What works in v0.1.0-alpha1
 
 - Weapon sounds: shoot (+randomized `shoot0..9`), after-shot, distant shots
   (speed-of-sound delay), reload / reload_one / reload_two, dryfire,

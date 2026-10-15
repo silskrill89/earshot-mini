@@ -324,6 +324,13 @@ const char* LogFilePath() {
 }
 } // namespace
 
+// Status-panel accessor: the exact path EshLog()/EshLog_WriteLine() write to.
+// Thin forwarder so the debug menu never re-derives (and can never drift from)
+// the logger's own path.
+const char* EshSoundBank::EshLogFilePath() {
+    return LogFilePath();
+}
+
 void EshSoundBank::EshLog(const char* fmt, ...) {
     FILE* f = static_cast<FILE*>(s_logFile);
 
@@ -390,4 +397,49 @@ void EshSoundBank::EshLogSetConfig(bool enabled, unsigned long long maxBytes) {
     s_logging = enabled;
     if (maxBytes > 0)
         s_maxBytesInLog = maxBytes;
+}
+
+void EshSoundBank::EshLog_WriteLine(const char* line) {
+    // Debug-lane writer (src/debug/EshLog.h): one pre-formatted line + '\n',
+    // no AR date prefix (the caller carries its own [HH:MM:SS.mmm]). Same
+    // Logging gate + byte cap as EshLog; the farewell line stays EshLog's job.
+    if (!s_logging || !line)
+        return;
+    FILE* f = static_cast<FILE*>(s_logFile);
+    if (!f) {
+        f = fopen(LogFilePath(), "a");
+        if (!f)
+            return;   // never block the caller (C.2 #2 — no dialogs)
+        s_logFile = f;
+    }
+    s_numBytesInLog += static_cast<unsigned long long>(fprintf(f, "%s\n", line));
+    if (s_numBytesInLog >= s_maxBytesInLog) {
+        EshLogClearFile();
+        return;
+    }
+    fflush(f);
+}
+
+void EshSoundBank::EshLogRotateFile() {
+    // Boot rotation (skygfx diagnostics.cpp:373-390): move the previous
+    // boot's log to <name>.prev.log BEFORE EshLogClearFile truncates, so a
+    // crash's evidence survives the next launch. MoveFileEx replaces the
+    // older rotation (stays one boot behind); CopyFile is the locked-reader
+    // fallback. Failure is harmless — an absent source means nothing to keep.
+    const char* src = LogFilePath();
+    if (!src[0])
+        return;
+    char dst[MAX_PATH];
+    _snprintf(dst, MAX_PATH, "%s", src);
+    dst[MAX_PATH - 1] = '\0';
+    // "<dir>\EarshotReminid.log" -> "<dir>\EarshotReminid.prev.log"; strip
+    // only the FILENAME's extension (dots in the directory must survive).
+    char* slash = strrchr(dst, '\\');
+    if (!slash) slash = strrchr(dst, '/');
+    char* dot = strrchr(dst, '.');
+    if (dot && (!slash || dot > slash))
+        *dot = '\0';
+    strncat(dst, ".prev.log", MAX_PATH - strlen(dst) - 1);
+    if (!MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING))
+        CopyFileA(src, dst, FALSE);
 }
